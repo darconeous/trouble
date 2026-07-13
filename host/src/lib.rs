@@ -810,6 +810,20 @@ impl<'stack, C: Controller, P: PacketPool> StackBuilder<'stack, C, P> {
         self
     }
 
+    /// Enable or disable accepting new peripheral pairing requests.
+    ///
+    /// When disabled, an idle incoming pairing request is rejected immediately with
+    /// `Pairing Failed: Pairing Not Supported`. A pairing already in progress is not
+    /// affected.
+    #[cfg(feature = "security")]
+    pub fn set_pairing_enabled(mut self, enabled: bool) -> Self {
+        self.host()
+            .connections
+            .security_manager
+            .set_pairing_enabled(enabled);
+        self
+    }
+
     /// Enable or disable secure connections only mode.
     ///
     /// When enabled, legacy pairing is rejected even if the `legacy-pairing` feature is compiled in.
@@ -886,6 +900,19 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
             .connections
             .security_manager
             .set_io_capabilities(io_capabilities);
+    }
+
+    /// Enable or disable accepting new peripheral pairing requests.
+    ///
+    /// When disabled, an idle incoming pairing request is rejected immediately with
+    /// `Pairing Failed: Pairing Not Supported`. A pairing already in progress is not
+    /// affected.
+    #[cfg(feature = "security")]
+    pub fn set_pairing_enabled(&self, enabled: bool) {
+        self.host
+            .connections
+            .security_manager
+            .set_pairing_enabled(enabled);
     }
 
     /// Enable or disable secure connections only mode.

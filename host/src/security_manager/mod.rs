@@ -200,6 +200,8 @@ struct Inner {
     finished_waker: WakerRegistration,
     /// Io capabilities
     io_capabilities: IoCapabilities,
+    /// Whether a new peripheral pairing procedure may be started.
+    pairing_enabled: bool,
     /// When true, reject legacy pairing even if the feature is compiled in
     #[cfg(feature = "legacy-pairing")]
     secure_connections_only: bool,
@@ -265,6 +267,9 @@ impl Inner {
             peer_identity,
         } = *cmd;
         if self.is_idle() && command == Command::PairingRequest {
+            if !self.pairing_enabled {
+                return Err(Error::Security(Reason::PairingNotSupported));
+            }
             let local_address = self.connection_local_address(storage)?;
             let peer_address = Self::connection_peer_address(storage);
             let local_io = self.io_capabilities;
@@ -635,6 +640,7 @@ impl<'d> SecurityManager<'d> {
                 pairing_sm: None,
                 finished_waker: WakerRegistration::new(),
                 io_capabilities: IoCapabilities::NoInputNoOutput,
+                pairing_enabled: true,
                 #[cfg(feature = "legacy-pairing")]
                 secure_connections_only: false,
             }),
@@ -646,6 +652,11 @@ impl<'d> SecurityManager<'d> {
     /// Set the IO capabilities
     pub(crate) fn set_io_capabilities(&self, io_capabilities: IoCapabilities) {
         self.inner.borrow_mut().io_capabilities = io_capabilities;
+    }
+
+    /// Enable or disable starting a new peripheral pairing procedure.
+    pub(crate) fn set_pairing_enabled(&self, enabled: bool) {
+        self.inner.borrow_mut().pairing_enabled = enabled;
     }
 
     /// Enable or disable secure connections only mode.
@@ -1325,6 +1336,7 @@ mod tests {
             )),
             finished_waker: WakerRegistration::new(),
             io_capabilities: IoCapabilities::NoInputNoOutput,
+            pairing_enabled: true,
             #[cfg(feature = "legacy-pairing")]
             secure_connections_only: false,
         }
@@ -1403,6 +1415,35 @@ mod tests {
             );
             assert!(inner.pairing_sm.is_some());
             assert_eq!(inner.pairing_sm.as_ref().unwrap().peer_address(), other);
+            Ok(())
+        }));
+    }
+
+    #[test]
+    fn disabled_pairing_rejects_idle_request_without_creating_state() {
+        let mgr = setup_manager();
+        let handle = ConnHandle::new(5);
+        let peer = Identity::from(Address::random([0x13, 2, 3, 4, 5, 6]));
+        unwrap!(mgr.connect(handle, peer.addr, LeConnRole::Peripheral, ConnParams::new()));
+
+        let mut inner = test_inner(peer.addr);
+        inner.pairing_sm = None;
+        inner.pairing_enabled = false;
+        let mut bonds: heapless::Vec<BondInformation, 4> = heapless::Vec::new();
+        let events = Channel::<NoopRawMutex, SecurityEventData, 3>::new();
+        let cmd = SmpCommand {
+            command: Command::PairingRequest,
+            payload: &[0x03, 0, 0x08, 16, 0, 0],
+            handle,
+            peer_identity: peer,
+        };
+
+        unwrap!(mgr.with_connected_handle(handle, |storage| {
+            assert_eq!(
+                inner.handle_peripheral(&mut bonds, &events, &cmd, mgr, storage),
+                Err(Error::Security(Reason::PairingNotSupported))
+            );
+            assert!(inner.pairing_sm.is_none());
             Ok(())
         }));
     }
