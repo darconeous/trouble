@@ -113,6 +113,8 @@ struct SecurityManagerData {
     local_address: Option<Address>,
     /// Local Identity Resolving Key (set when privacy is enabled)
     local_irk: Option<IdentityResolvingKey>,
+    /// Fixed passkey used whenever this device has the display role.
+    fixed_passkey: Option<PassKey>,
 }
 
 impl SecurityManagerData {
@@ -121,6 +123,7 @@ impl SecurityManagerData {
         Self {
             local_address: None,
             local_irk: None,
+            fixed_passkey: None,
         }
     }
 }
@@ -657,6 +660,15 @@ impl<'d> SecurityManager<'d> {
     /// Enable or disable starting a new peripheral pairing procedure.
     pub(crate) fn set_pairing_enabled(&self, enabled: bool) {
         self.inner.borrow_mut().pairing_enabled = enabled;
+    }
+
+    /// Set the fixed passkey used when this device has the display role.
+    pub(crate) fn set_fixed_passkey(&self, passkey: Option<u32>) -> Result<(), Error> {
+        if passkey.is_some_and(|value| value > 999_999) {
+            return Err(Error::InvalidValue);
+        }
+        self.inner.borrow_mut().state.fixed_passkey = passkey.map(PassKey);
+        Ok(())
     }
 
     /// Enable or disable secure connections only mode.
@@ -1290,6 +1302,10 @@ impl<'sm, 'cm, 'cm2, 'cs, P: PacketPool> PairingOps<P> for PairingOpsImpl<'sm, '
     fn local_identity_address(&self) -> Result<Address, Error> {
         self.state.local_address.ok_or(Error::InvalidValue)
     }
+
+    fn fixed_passkey(&self) -> Option<PassKey> {
+        self.state.fixed_passkey
+    }
 }
 
 #[cfg(test)]
@@ -1328,6 +1344,7 @@ mod tests {
             state: SecurityManagerData {
                 local_address: Some(Address::random([1, 2, 3, 4, 5, 6])),
                 local_irk: None,
+                fixed_passkey: None,
             },
             pairing_sm: Some(Pairing::new_peripheral(
                 Address::random([1, 2, 3, 4, 5, 6]),

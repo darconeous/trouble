@@ -384,7 +384,9 @@ impl Pairing {
             }
             PairingMethod::PassKeyEntry { central, .. } => {
                 if central == PassKeyEntryAction::Display {
-                    let tk = rng.sample(rand::distributions::Uniform::new_inclusive(0u32, 999999)) as u128;
+                    let tk = ops.fixed_passkey().map(|key| key.value() as u128).unwrap_or_else(|| {
+                        rng.sample(rand::distributions::Uniform::new_inclusive(0u32, 999999)) as u128
+                    });
                     ops.try_send_connection_event(ConnectionEvent::PassKeyDisplay(PassKey(tk as u32)))?;
                     let mut confirm_data = ConfirmPhaseData {
                         tk,

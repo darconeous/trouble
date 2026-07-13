@@ -306,7 +306,10 @@ impl Pairing {
             }
             PairingMethod::PassKeyEntry { peripheral, .. } => {
                 if peripheral == PassKeyEntryAction::Display {
-                    phase_data.local_secret_rb = rng.sample(rand::distributions::Uniform::new_inclusive(0, 999999));
+                    phase_data.local_secret_rb = ops
+                        .fixed_passkey()
+                        .map(|key| key.value() as u128)
+                        .unwrap_or_else(|| rng.sample(rand::distributions::Uniform::new_inclusive(0, 999999)));
                     phase_data.peer_secret_ra = phase_data.local_secret_rb;
                     ops.try_send_connection_event(ConnectionEvent::PassKeyDisplay(PassKey(
                         phase_data.local_secret_rb as u32,

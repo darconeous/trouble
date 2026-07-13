@@ -89,6 +89,10 @@ pub trait PairingOps<P: PacketPool> {
     /// The local identity address (public or static random), used for Identity Address Information.
     /// This is distinct from the address used for pairing calculations, which may be an RPA.
     fn local_identity_address(&self) -> Result<Address, Error>;
+    /// Fixed passkey to use when this device has the display role.
+    fn fixed_passkey(&self) -> Option<crate::security_manager::PassKey> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -376,6 +380,7 @@ mod tests {
     use rand_core::SeedableRng;
 
     use super::*;
+    use crate::security_manager::PassKey;
     use crate::{Identity, Packet};
 
     #[derive(Debug)]
@@ -422,6 +427,7 @@ mod tests {
         pub(crate) oob_available: bool,
         pub(crate) secret_key: crate::security_manager::crypto::SecretKey,
         pub(crate) public_key: crate::security_manager::crypto::PublicKey,
+        pub(crate) fixed_passkey: Option<PassKey>,
     }
 
     impl<const N: usize> TestOps<N> {
@@ -438,6 +444,7 @@ mod tests {
                 oob_available: false,
                 secret_key,
                 public_key,
+                fixed_passkey: None,
             }
         }
     }
@@ -445,6 +452,10 @@ mod tests {
     impl<const N: usize> PairingOps<HeaplessPool> for TestOps<N> {
         fn try_send_packet(&mut self, packet: TxPacket<HeaplessPool>) -> Result<(), Error> {
             self.sent_packets.push(packet).map_err(|_| Error::OutOfMemory)
+        }
+
+        fn fixed_passkey(&self) -> Option<PassKey> {
+            self.fixed_passkey
         }
 
         fn try_enable_encryption(
@@ -767,6 +778,7 @@ mod tests {
         let central = Address::random([0xff, 2, 2, 3, 4, 5]);
 
         let mut peripheral_ops = TestOps::<80>::new(0xDEAD);
+        peripheral_ops.fixed_passkey = Some(PassKey(123_456));
         let mut central_ops = TestOps::<80>::new(0xBEEF);
 
         let mut peripheral_pairing = Pairing::new_peripheral(peripheral, central, IoCapabilities::DisplayOnly);
@@ -796,6 +808,7 @@ mod tests {
             ConnectionEvent::PassKeyDisplay(pk) => *pk,
             _ => panic!("Unexpected connection event"),
         };
+        assert_eq!(pass_key.value(), 123_456);
 
         assert!(matches!(
             central_ops.connection_events[0],

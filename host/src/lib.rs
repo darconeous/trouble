@@ -817,11 +817,16 @@ impl<'stack, C: Controller, P: PacketPool> StackBuilder<'stack, C, P> {
     /// affected.
     #[cfg(feature = "security")]
     pub fn set_pairing_enabled(mut self, enabled: bool) -> Self {
-        self.host()
-            .connections
-            .security_manager
-            .set_pairing_enabled(enabled);
+        self.host().connections.security_manager.set_pairing_enabled(enabled);
         self
+    }
+
+    /// Set a fixed six-digit passkey for pairings where this device has the
+    /// display role. Pass `None` to restore a randomly generated passkey.
+    #[cfg(feature = "security")]
+    pub fn set_fixed_passkey(mut self, passkey: Option<u32>) -> Result<Self, Error> {
+        self.host().connections.security_manager.set_fixed_passkey(passkey)?;
+        Ok(self)
     }
 
     /// Enable or disable secure connections only mode.
@@ -909,10 +914,14 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
     /// affected.
     #[cfg(feature = "security")]
     pub fn set_pairing_enabled(&self, enabled: bool) {
-        self.host
-            .connections
-            .security_manager
-            .set_pairing_enabled(enabled);
+        self.host.connections.security_manager.set_pairing_enabled(enabled);
+    }
+
+    /// Set a fixed six-digit passkey for pairings where this device has the
+    /// display role. Pass `None` to restore a randomly generated passkey.
+    #[cfg(feature = "security")]
+    pub fn set_fixed_passkey(&self, passkey: Option<u32>) -> Result<(), Error> {
+        self.host.connections.security_manager.set_fixed_passkey(passkey)
     }
 
     /// Enable or disable secure connections only mode.
