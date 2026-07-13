@@ -18,6 +18,8 @@ use bt_hci::param::{ConnHandle, EncryptionEnabledLevel, LeConnRole};
 use bt_hci::FromHciBytes;
 pub use crypto::{IdentityResolvingKey, LongTermKey};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+#[cfg(feature = "security-debug")]
+use embassy_sync::blocking_mutex::{raw::CriticalSectionRawMutex, Mutex as BlockingMutex};
 use embassy_sync::channel::Channel;
 use embassy_sync::waitqueue::WakerRegistration;
 use embassy_time::{Instant, TimeoutError, WithTimeout};
@@ -38,6 +40,124 @@ use crate::security_manager::types::AuthReq;
 use crate::security_manager::types::BondingFlag;
 use crate::types::l2cap::L2CAP_CID_LE_U_SECURITY_MANAGER;
 use crate::{Address, Error, Identity, IoCapabilities, PacketPool};
+
+/// Direction of one redacted Security Manager Protocol command trace.
+#[cfg(feature = "security-debug")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecurityTraceDirection {
+    /// Command received from the peer.
+    Rx,
+    /// Command sent to the peer.
+    Tx,
+}
+
+/// Redacted Security Manager Protocol command metadata.
+///
+/// `detail` is populated only for Pairing Request/Response, Pairing Failed,
+/// and Security Request. Key material, nonces, confirmations, and passkeys
+/// are never copied into this event.
+#[cfg(feature = "security-debug")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecurityTrace {
+    /// Command direction.
+    pub direction: SecurityTraceDirection,
+    /// SMP command opcode.
+    pub command: u8,
+    /// Non-secret command metadata.
+    pub detail: [u8; 8],
+    /// Number of valid bytes in `detail`.
+    pub detail_len: u8,
+}
+
+/// Internal security-manager diagnostic event with no key material.
+#[cfg(feature = "security-debug")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecurityDiagnosticTrace {
+    /// An internal timer-change notification was queued or dropped.
+    TimerChangeQueued {
+        /// Whether the notification entered the internal queue.
+        queued: bool,
+    },
+    /// A public encrypted connection event was queued or dropped.
+    EncryptedEventQueued {
+        /// Whether the event entered the connection event queue.
+        queued: bool,
+    },
+    /// An internal resolving-list bond notification was queued or dropped.
+    BondAddedQueued {
+        /// Whether the notification entered the internal queue.
+        queued: bool,
+    },
+    /// An encryption-failure transition was processed by the pairing state machine.
+    EncryptionFailureHandled {
+        /// Whether the pairing state machine accepted the transition.
+        succeeded: bool,
+    },
+    /// Reporting a security state-machine error to the peer succeeded or failed.
+    SecurityErrorReported {
+        /// Whether reporting the error to the peer succeeded.
+        succeeded: bool,
+    },
+}
+
+#[cfg(feature = "security-debug")]
+static SECURITY_TRACE_HANDLER: BlockingMutex<CriticalSectionRawMutex, RefCell<Option<fn(SecurityTrace)>>> =
+    BlockingMutex::new(RefCell::new(None));
+#[cfg(feature = "security-debug")]
+static SECURITY_DIAGNOSTIC_TRACE_HANDLER: BlockingMutex<
+    CriticalSectionRawMutex,
+    RefCell<Option<fn(SecurityDiagnosticTrace)>>,
+> = BlockingMutex::new(RefCell::new(None));
+
+/// Install or clear the global redacted SMP trace callback.
+#[cfg(feature = "security-debug")]
+pub fn set_security_trace_handler(handler: Option<fn(SecurityTrace)>) {
+    SECURITY_TRACE_HANDLER.lock(|slot| *slot.borrow_mut() = handler);
+}
+
+/// Install or clear the global redacted internal security diagnostic callback.
+#[cfg(feature = "security-debug")]
+pub fn set_security_diagnostic_trace_handler(handler: Option<fn(SecurityDiagnosticTrace)>) {
+    SECURITY_DIAGNOSTIC_TRACE_HANDLER.lock(|slot| *slot.borrow_mut() = handler);
+}
+
+#[cfg(feature = "security-debug")]
+fn security_diagnostic_trace(event: SecurityDiagnosticTrace) {
+    SECURITY_DIAGNOSTIC_TRACE_HANDLER.lock(|slot| {
+        if let Some(handler) = *slot.borrow() {
+            handler(event);
+        }
+    });
+}
+
+#[cfg(feature = "security-debug")]
+fn security_trace(direction: SecurityTraceDirection, command: Command, payload: &[u8]) {
+    let mut detail = [0u8; 8];
+    let detail_len = match command {
+        Command::PairingRequest | Command::PairingResponse => payload.len().min(detail.len()),
+        Command::IdentityAddressInformation => payload.len().min(detail.len()),
+        Command::PairingFailed | Command::SecurityRequest => payload.len().min(1),
+        _ => 0,
+    };
+    detail[..detail_len].copy_from_slice(&payload[..detail_len]);
+    let event = SecurityTrace {
+        direction,
+        command: command.into(),
+        detail,
+        detail_len: detail_len as u8,
+    };
+    SECURITY_TRACE_HANDLER.lock(|slot| {
+        if let Some(handler) = *slot.borrow() {
+            handler(event);
+        }
+    });
+}
+
+fn queue_timer_change(events: &Channel<NoopRawMutex, SecurityEventData, 3>) {
+    let queued = events.try_send(SecurityEventData::TimerChange).is_ok();
+    #[cfg(feature = "security-debug")]
+    security_diagnostic_trace(SecurityDiagnosticTrace::TimerChangeQueued { queued });
+}
 
 /// Events of interest to the security manager
 pub(crate) enum SecurityEventData {
@@ -113,6 +233,8 @@ struct SecurityManagerData {
     local_address: Option<Address>,
     /// Local Identity Resolving Key (set when privacy is enabled)
     local_irk: Option<IdentityResolvingKey>,
+    /// Fixed passkey used whenever this device has the display role.
+    fixed_passkey: Option<PassKey>,
 }
 
 impl SecurityManagerData {
@@ -121,6 +243,7 @@ impl SecurityManagerData {
         Self {
             local_address: None,
             local_irk: None,
+            fixed_passkey: None,
         }
     }
 }
@@ -200,6 +323,8 @@ struct Inner {
     finished_waker: WakerRegistration,
     /// Io capabilities
     io_capabilities: IoCapabilities,
+    /// Whether a new peripheral pairing procedure may be started.
+    pairing_enabled: bool,
     /// When true, reject legacy pairing even if the feature is compiled in
     #[cfg(feature = "legacy-pairing")]
     secure_connections_only: bool,
@@ -265,6 +390,9 @@ impl Inner {
             peer_identity,
         } = *cmd;
         if self.is_idle() && command == Command::PairingRequest {
+            if !self.pairing_enabled {
+                return Err(Error::Security(Reason::PairingNotSupported));
+            }
             let local_address = self.connection_local_address(storage)?;
             let peer_address = Self::connection_peer_address(storage);
             let local_io = self.io_capabilities;
@@ -431,7 +559,7 @@ impl Inner {
             let res = sm.handle_event(pairing_event, &mut ops, &mut self.rng);
             if res.is_ok() {
                 sm.reset_timeout();
-                let _ = events.try_send(SecurityEventData::TimerChange);
+                queue_timer_change(events);
             }
             res
         } else {
@@ -471,7 +599,7 @@ impl Inner {
             }
             if sm.result().is_some() {
                 self.finished_waker.wake();
-                let _ = events.try_send(SecurityEventData::TimerChange);
+                queue_timer_change(events);
             }
             res
         } else {
@@ -502,10 +630,15 @@ impl Inner {
 
         // Emit an Encrypted event for both new-pairing and resumed-bond paths.
         if encrypted && storage.security_level != SecurityLevel::NoEncryption {
-            let _ = storage.events.try_send(ConnectionEvent::Encrypted {
-                security_level: storage.security_level,
-                bond,
-            });
+            let queued = storage
+                .events
+                .try_send(ConnectionEvent::Encrypted {
+                    security_level: storage.security_level,
+                    bond,
+                })
+                .is_ok();
+            #[cfg(feature = "security-debug")]
+            security_diagnostic_trace(SecurityDiagnosticTrace::EncryptedEventQueued { queued });
         }
 
         res
@@ -529,7 +662,7 @@ impl Inner {
             if sm.is_waiting_bonded_encryption() {
                 storage.bond_rejected = true;
             }
-            let _res = sm.handle_event(
+            let result = sm.handle_event(
                 pairing::Event::LinkEncryptedResult(false),
                 &mut PairingOpsImpl {
                     bonds,
@@ -544,12 +677,16 @@ impl Inner {
                 },
                 &mut self.rng,
             );
+            #[cfg(feature = "security-debug")]
+            security_diagnostic_trace(SecurityDiagnosticTrace::EncryptionFailureHandled {
+                succeeded: result.is_ok(),
+            });
             // Don't call handle_security_error here: sending SMP PairingFailed
             // for an HCI-level encryption failure would cause the peer to
             // delete its bond information, preventing future re-encryption.
             if sm.result().is_some() {
                 self.finished_waker.wake();
-                let _ = events.try_send(SecurityEventData::TimerChange);
+                queue_timer_change(events);
             }
         }
     }
@@ -635,6 +772,7 @@ impl<'d> SecurityManager<'d> {
                 pairing_sm: None,
                 finished_waker: WakerRegistration::new(),
                 io_capabilities: IoCapabilities::NoInputNoOutput,
+                pairing_enabled: true,
                 #[cfg(feature = "legacy-pairing")]
                 secure_connections_only: false,
             }),
@@ -646,6 +784,20 @@ impl<'d> SecurityManager<'d> {
     /// Set the IO capabilities
     pub(crate) fn set_io_capabilities(&self, io_capabilities: IoCapabilities) {
         self.inner.borrow_mut().io_capabilities = io_capabilities;
+    }
+
+    /// Enable or disable starting a new peripheral pairing procedure.
+    pub(crate) fn set_pairing_enabled(&self, enabled: bool) {
+        self.inner.borrow_mut().pairing_enabled = enabled;
+    }
+
+    /// Set the fixed passkey used when this device has the display role.
+    pub(crate) fn set_fixed_passkey(&self, passkey: Option<u32>) -> Result<(), Error> {
+        if passkey.is_some_and(|value| value > 999_999) {
+            return Err(Error::InvalidValue);
+        }
+        self.inner.borrow_mut().state.fixed_passkey = passkey.map(PassKey);
+        Ok(())
     }
 
     /// Enable or disable secure connections only mode.
@@ -831,6 +983,8 @@ impl<'d> SecurityManager<'d> {
         storage: &ConnectionStorage<P::Packet>,
     ) -> Result<(), Error> {
         let (command, buffer, size) = Self::parse_smp_command::<P>(pdu)?;
+        #[cfg(feature = "security-debug")]
+        security_trace(SecurityTraceDirection::Rx, command, &buffer[1..size]);
         let cmd = SmpCommand {
             command,
             payload: &buffer[1..size],
@@ -853,6 +1007,8 @@ impl<'d> SecurityManager<'d> {
         storage: &ConnectionStorage<P::Packet>,
     ) -> Result<(), Error> {
         let (command, buffer, size) = Self::parse_smp_command::<P>(pdu)?;
+        #[cfg(feature = "security-debug")]
+        security_trace(SecurityTraceDirection::Rx, command, &buffer[1..size]);
         let cmd = SmpCommand {
             command,
             payload: &buffer[1..size],
@@ -887,7 +1043,7 @@ impl<'d> SecurityManager<'d> {
             if result.is_ok() {
                 if let Some(sm) = inner.pairing_sm.as_mut() {
                     sm.reset_timeout();
-                    let _ = self.events.try_send(SecurityEventData::TimerChange);
+                    queue_timer_change(&self.events);
                 }
             }
         }
@@ -1033,7 +1189,11 @@ impl<'d> SecurityManager<'d> {
                             connections,
                             storage,
                         );
-                        let _ = self.handle_security_error(connections, storage, &res);
+                        let report_result = self.handle_security_error(connections, storage, &res);
+                        #[cfg(feature = "security-debug")]
+                        security_diagnostic_trace(SecurityDiagnosticTrace::SecurityErrorReported {
+                            succeeded: report_result.is_ok(),
+                        });
                         res
                     })?;
                 }
@@ -1131,6 +1291,8 @@ impl<'d> SecurityManager<'d> {
         connections: &ConnectionManager<P>,
         handle: ConnHandle,
     ) -> Result<(), Error> {
+        #[cfg(feature = "security-debug")]
+        security_trace(SecurityTraceDirection::Tx, packet.command(), packet.payload());
         let len = packet.total_size();
         trace!("[security manager] Send {} {}", packet.command, len);
         connections.try_outbound(handle, packet.into_pdu())
@@ -1169,19 +1331,24 @@ struct PairingOpsImpl<'sm, 'cm, 'cm2, 'cs, P: PacketPool> {
 
 impl<'sm, 'cm, 'cm2, 'cs, P: PacketPool> PairingOps<P> for PairingOpsImpl<'sm, 'cm, 'cm2, 'cs, P> {
     fn try_send_packet(&mut self, packet: TxPacket<P>) -> Result<(), Error> {
+        #[cfg(feature = "security-debug")]
+        security_trace(SecurityTraceDirection::Tx, packet.command(), packet.payload());
         let len = packet.total_size();
         trace!("[security manager] Send {} {}", packet.command, len);
         self.connections.try_outbound(self.conn_handle, packet.into_pdu())?;
-        let _ = self.events.try_send(SecurityEventData::TimerChange);
+        queue_timer_change(self.events);
         Ok(())
     }
 
     fn try_update_bond_information(&mut self, bond: &BondInformation) -> Result<(), Error> {
         add_bond(self.bonds, bond.clone())?;
         if bond.identity.irk.is_some() {
-            let _ = self
+            let queued = self
                 .events
-                .try_send(SecurityEventData::BondAdded(self.conn_handle, bond.identity));
+                .try_send(SecurityEventData::BondAdded(self.conn_handle, bond.identity))
+                .is_ok();
+            #[cfg(feature = "security-debug")]
+            security_diagnostic_trace(SecurityDiagnosticTrace::BondAddedQueued { queued });
         }
         Ok(())
     }
@@ -1255,7 +1422,7 @@ impl<'sm, 'cm, 'cm2, 'cs, P: PacketPool> PairingOps<P> for PairingOpsImpl<'sm, '
         );
         self.storage.events.try_send(event).map_err(|_| Error::OutOfMemory)?;
         if timer_changed {
-            let _ = self.events.try_send(SecurityEventData::TimerChange);
+            queue_timer_change(self.events);
         }
         Ok(())
     }
@@ -1278,6 +1445,10 @@ impl<'sm, 'cm, 'cm2, 'cs, P: PacketPool> PairingOps<P> for PairingOpsImpl<'sm, '
 
     fn local_identity_address(&self) -> Result<Address, Error> {
         self.state.local_address.ok_or(Error::InvalidValue)
+    }
+
+    fn fixed_passkey(&self) -> Option<PassKey> {
+        self.state.fixed_passkey
     }
 }
 
@@ -1317,6 +1488,7 @@ mod tests {
             state: SecurityManagerData {
                 local_address: Some(Address::random([1, 2, 3, 4, 5, 6])),
                 local_irk: None,
+                fixed_passkey: None,
             },
             pairing_sm: Some(Pairing::new_peripheral(
                 Address::random([1, 2, 3, 4, 5, 6]),
@@ -1325,6 +1497,7 @@ mod tests {
             )),
             finished_waker: WakerRegistration::new(),
             io_capabilities: IoCapabilities::NoInputNoOutput,
+            pairing_enabled: true,
             #[cfg(feature = "legacy-pairing")]
             secure_connections_only: false,
         }
@@ -1403,6 +1576,35 @@ mod tests {
             );
             assert!(inner.pairing_sm.is_some());
             assert_eq!(inner.pairing_sm.as_ref().unwrap().peer_address(), other);
+            Ok(())
+        }));
+    }
+
+    #[test]
+    fn disabled_pairing_rejects_idle_request_without_creating_state() {
+        let mgr = setup_manager();
+        let handle = ConnHandle::new(5);
+        let peer = Identity::from(Address::random([0x13, 2, 3, 4, 5, 6]));
+        unwrap!(mgr.connect(handle, peer.addr, LeConnRole::Peripheral, ConnParams::new()));
+
+        let mut inner = test_inner(peer.addr);
+        inner.pairing_sm = None;
+        inner.pairing_enabled = false;
+        let mut bonds: heapless::Vec<BondInformation, 4> = heapless::Vec::new();
+        let events = Channel::<NoopRawMutex, SecurityEventData, 3>::new();
+        let cmd = SmpCommand {
+            command: Command::PairingRequest,
+            payload: &[0x03, 0, 0x08, 16, 0, 0],
+            handle,
+            peer_identity: peer,
+        };
+
+        unwrap!(mgr.with_connected_handle(handle, |storage| {
+            assert_eq!(
+                inner.handle_peripheral(&mut bonds, &events, &cmd, mgr, storage),
+                Err(Error::Security(Reason::PairingNotSupported))
+            );
+            assert!(inner.pairing_sm.is_none());
             Ok(())
         }));
     }

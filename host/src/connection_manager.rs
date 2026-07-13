@@ -7,6 +7,8 @@ use core::task::{Context, Poll};
 
 use bt_hci::param::{AddrKind, BdAddr, ConnHandle, DisconnectReason, LeConnRole, Status};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+#[cfg(feature = "security-debug")]
+use embassy_sync::blocking_mutex::{raw::CriticalSectionRawMutex, Mutex as BlockingMutex};
 use embassy_sync::channel::Channel;
 use embassy_sync::waitqueue::WakerRegistration;
 #[cfg(feature = "security")]
@@ -19,6 +21,107 @@ use crate::prelude::sar::PacketReassembly;
 #[cfg(feature = "security")]
 use crate::security_manager::{SecurityEventData, SecurityManager};
 use crate::{config, Address, Error, Identity, PacketPool};
+
+/// Redacted connection-manager lifecycle event for diagnostic builds.
+#[cfg(feature = "security-debug")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionTrace {
+    /// The controller reported a new link and Trouble allocated a slot.
+    Connected {
+        /// Trouble connection slot.
+        index: u8,
+        /// Controller connection handle.
+        handle: ConnHandle,
+    },
+    /// The application accepted the pending link.
+    Accepted {
+        /// Trouble connection slot.
+        index: u8,
+        /// Controller connection handle.
+        handle: ConnHandle,
+        /// Reference count after accepting.
+        refs: u8,
+    },
+    /// A connection handle reference was cloned.
+    RefIncremented {
+        /// Trouble connection slot.
+        index: u8,
+        /// Controller connection handle.
+        handle: ConnHandle,
+        /// Reference count after incrementing.
+        refs: u8,
+    },
+    /// A connection handle reference was dropped.
+    RefDecremented {
+        /// Trouble connection slot.
+        index: u8,
+        /// Controller connection handle.
+        handle: ConnHandle,
+        /// Reference count after decrementing.
+        refs: u8,
+        /// Whether the last drop requested a disconnect.
+        requested_disconnect: bool,
+    },
+    /// Trouble was asked to initiate an HCI disconnect.
+    DisconnectRequested {
+        /// Trouble connection slot, if found.
+        index: Option<u8>,
+        /// Controller connection handle.
+        handle: ConnHandle,
+        /// Requested HCI reason.
+        reason: DisconnectReason,
+        /// Whether a connected link entered disconnect-pending state.
+        accepted: bool,
+    },
+    /// The runner consumed a pending disconnect request.
+    DisconnectCommand {
+        /// Trouble connection slot.
+        index: u8,
+        /// Controller connection handle.
+        handle: ConnHandle,
+        /// HCI reason sent to the controller.
+        reason: DisconnectReason,
+    },
+    /// Trouble answered a controller request for the peer's encryption key.
+    LongTermKeyReply {
+        /// Controller connection handle.
+        handle: ConnHandle,
+        /// Whether a matching key was present in Trouble's bond table.
+        key_found: bool,
+        /// Whether the positive or negative HCI reply command succeeded.
+        reply_succeeded: bool,
+    },
+    /// The controller reported that a link was disconnected.
+    Disconnected {
+        /// Trouble connection slot, if found.
+        index: Option<u8>,
+        /// Controller connection handle.
+        handle: ConnHandle,
+        /// Raw controller-supplied status.
+        reason: Status,
+        /// Whether the application event was queued.
+        event_queued: bool,
+    },
+}
+
+#[cfg(feature = "security-debug")]
+static CONNECTION_TRACE_HANDLER: BlockingMutex<CriticalSectionRawMutex, RefCell<Option<fn(ConnectionTrace)>>> =
+    BlockingMutex::new(RefCell::new(None));
+
+/// Install or clear the global redacted connection lifecycle callback.
+#[cfg(feature = "security-debug")]
+pub fn set_connection_trace_handler(handler: Option<fn(ConnectionTrace)>) {
+    CONNECTION_TRACE_HANDLER.lock(|slot| *slot.borrow_mut() = handler);
+}
+
+#[cfg(feature = "security-debug")]
+fn connection_trace(event: ConnectionTrace) {
+    CONNECTION_TRACE_HANDLER.lock(|slot| {
+        if let Some(handler) = *slot.borrow() {
+            handler(event);
+        }
+    });
+}
 
 /// Resolvable private addresses used on a connection.
 ///
@@ -338,19 +441,40 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
 
     pub(crate) fn request_disconnect(&self, index: u8, reason: DisconnectReason) {
         let entry = &mut self.connection_mut(index);
-        if entry.state == ConnectionState::Connected {
+        let accepted = entry.state == ConnectionState::Connected;
+        if accepted {
             entry.state = ConnectionState::DisconnectRequest(reason);
             self.state.borrow_mut().disconnect_waker.wake();
         }
+        #[cfg(feature = "security-debug")]
+        connection_trace(ConnectionTrace::DisconnectRequested {
+            index: Some(index),
+            handle: entry.handle,
+            reason,
+            accepted,
+        });
     }
 
     pub(crate) fn request_handle_disconnect(&self, handle: ConnHandle, reason: DisconnectReason) {
+        #[cfg(feature = "security-debug")]
+        let mut accepted = false;
         if let Some(mut entry) = self.connection_by_handle_mut(handle) {
             if entry.state == ConnectionState::Connected && handle == entry.handle {
+                #[cfg(feature = "security-debug")]
+                {
+                    accepted = true;
+                }
                 entry.state = ConnectionState::DisconnectRequest(reason);
                 self.state.borrow_mut().disconnect_waker.wake();
             }
         }
+        #[cfg(feature = "security-debug")]
+        connection_trace(ConnectionTrace::DisconnectRequested {
+            index: None,
+            handle,
+            reason,
+            accepted,
+        });
     }
 
     pub(crate) fn poll_disconnecting<'m>(
@@ -446,7 +570,17 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 storage.acl_send_locked = false;
                 storage.link_credit_waker.wake();
                 storage.acl_send_lock_waker.wake();
-                let _ = storage.events.try_send(ConnectionEvent::Disconnected { reason });
+                let event_queued = storage
+                    .events
+                    .try_send(ConnectionEvent::Disconnected { reason })
+                    .is_ok();
+                #[cfg(feature = "security-debug")]
+                connection_trace(ConnectionTrace::Disconnected {
+                    index: Some(idx as u8),
+                    handle: h,
+                    reason,
+                    event_queued,
+                });
                 #[cfg(feature = "gatt")]
                 {
                     storage.gatt.clear();
@@ -470,6 +604,13 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 return Ok(());
             }
         }
+        #[cfg(feature = "security-debug")]
+        connection_trace(ConnectionTrace::Disconnected {
+            index: None,
+            handle: h,
+            reason,
+            event_queued: false,
+        });
         warn!("[link][disconnect] connection handle {:?} not found", h);
         Err(Error::NotFound)
     }
@@ -540,6 +681,11 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                         state.peripheral_waker.wake();
                     }
                 }
+                #[cfg(feature = "security-debug")]
+                connection_trace(ConnectionTrace::Connected {
+                    index: idx as u8,
+                    handle,
+                });
                 return Ok(());
             }
         }
@@ -577,6 +723,12 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                                 debug!("[link][poll_accept] connection accepted: state: {:?}", storage);
                                 assert_eq!(storage.refcount, 0);
                                 storage.inc_ref();
+                                #[cfg(feature = "security-debug")]
+                                connection_trace(ConnectionTrace::Accepted {
+                                    index: idx as u8,
+                                    handle,
+                                    refs: storage.refcount,
+                                });
                                 return Poll::Ready(Connection::new(idx as u8, self));
                             }
                         }
@@ -587,6 +739,12 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
 
                         assert_eq!(storage.refcount, 0);
                         storage.inc_ref();
+                        #[cfg(feature = "security-debug")]
+                        connection_trace(ConnectionTrace::Accepted {
+                            index: idx as u8,
+                            handle,
+                            refs: storage.refcount,
+                        });
                         return Poll::Ready(Connection::new(idx as u8, self));
                     }
                 }
@@ -604,12 +762,27 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
     }
 
     pub(crate) fn inc_ref(&self, index: u8) {
-        self.connection_mut(index).inc_ref();
+        let mut storage = self.connection_mut(index);
+        storage.inc_ref();
+        #[cfg(feature = "security-debug")]
+        connection_trace(ConnectionTrace::RefIncremented {
+            index,
+            handle: storage.handle,
+            refs: storage.refcount,
+        });
     }
 
     pub(crate) fn dec_ref(&self, index: u8) {
-        self.connection_mut(index)
-            .dec_ref(&mut self.state.borrow_mut().disconnect_waker);
+        let mut storage = self.connection_mut(index);
+        storage.dec_ref(&mut self.state.borrow_mut().disconnect_waker);
+        #[cfg(feature = "security-debug")]
+        connection_trace(ConnectionTrace::RefDecremented {
+            index,
+            handle: storage.handle,
+            refs: storage.refcount,
+            requested_disconnect: storage.refcount == 0
+                && matches!(storage.state, ConnectionState::DisconnectRequest(_)),
+        });
     }
 
     pub(crate) async fn accept(&'d self, role: LeConnRole, peers: &[Address]) -> Connection<'d, P> {
@@ -949,14 +1122,15 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
     ) -> Result<(), crate::BleHostError<C::Error>>
     where
         C: crate::ControllerCmdSync<bt_hci::cmd::le::LeLongTermKeyRequestReply>
+            + crate::ControllerCmdSync<bt_hci::cmd::le::LeLongTermKeyRequestNegativeReply>
             + crate::ControllerCmdAsync<bt_hci::cmd::le::LeEnableEncryption>,
     {
-        use bt_hci::cmd::le::{LeEnableEncryption, LeLongTermKeyRequestReply};
+        use bt_hci::cmd::le::{LeEnableEncryption, LeLongTermKeyRequestNegativeReply, LeLongTermKeyRequestReply};
 
         match _event {
             crate::security_manager::SecurityEventData::SendLongTermKey(handle, ediv, rand) => {
                 let identity = self.connection_by_handle(handle).map(|x| x.peer_identity);
-                if let Some(identity) = identity {
+                let ltk = if let Some(identity) = identity {
                     // Match EDIV/Rand against stored bonds to find the correct LTK.
                     // During active legacy pairing (STK phase), the STK is stored with EDIV=0, Rand=0.
                     let bond = self.security_manager.get_peer_bond_information(&identity);
@@ -970,18 +1144,29 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                             None
                         }
                     });
-                    if let Some(ltk) = ltk {
-                        let _ = host
-                            .command(LeLongTermKeyRequestReply::new(handle, ltk.to_le_bytes()))
-                            .await?;
-                    } else {
-                        warn!("[host] Long term key request reply failed, no long term key");
-                        // Send disconnect event to the controller
-                        self.request_handle_disconnect(handle, DisconnectReason::AuthenticationFailure);
-                    }
+                    ltk
                 } else {
-                    warn!("[host] Long term key request reply failed, unknown peer")
-                }
+                    warn!("[host] Long term key request for unknown peer");
+                    None
+                };
+                let key_found = ltk.is_some();
+                let reply_result = if let Some(ltk) = ltk {
+                    host.command(LeLongTermKeyRequestReply::new(handle, ltk.to_le_bytes()))
+                        .await
+                        .map(|_| ())
+                } else {
+                    warn!("[host] No long term key; sending negative reply");
+                    host.command(LeLongTermKeyRequestNegativeReply::new(handle))
+                        .await
+                        .map(|_| ())
+                };
+                #[cfg(feature = "security-debug")]
+                connection_trace(ConnectionTrace::LongTermKeyReply {
+                    handle,
+                    key_found,
+                    reply_succeeded: reply_result.is_ok(),
+                });
+                reply_result?;
             }
             crate::security_manager::SecurityEventData::EnableEncryption(handle, bond_info) => {
                 let role = self.connection_by_handle(handle).map(|x| x.role);
@@ -1138,6 +1323,12 @@ impl<P> DisconnectRequest<'_, P> {
             return;
         }
         storage.state = ConnectionState::Disconnecting(self.reason);
+        #[cfg(feature = "security-debug")]
+        connection_trace(ConnectionTrace::DisconnectCommand {
+            index: self.index as u8,
+            handle: self.handle,
+            reason: self.reason,
+        });
     }
 }
 pub struct ConnectionStorage<P> {

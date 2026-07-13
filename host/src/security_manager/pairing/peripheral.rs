@@ -306,7 +306,10 @@ impl Pairing {
             }
             PairingMethod::PassKeyEntry { peripheral, .. } => {
                 if peripheral == PassKeyEntryAction::Display {
-                    phase_data.local_secret_rb = rng.sample(rand::distributions::Uniform::new_inclusive(0, 999999));
+                    phase_data.local_secret_rb = ops
+                        .fixed_passkey()
+                        .map(|key| key.value() as u128)
+                        .unwrap_or_else(|| rng.sample(rand::distributions::Uniform::new_inclusive(0, 999999)));
                     phase_data.peer_secret_ra = phase_data.local_secret_rb;
                     ops.try_send_connection_event(ConnectionEvent::PassKeyDisplay(PassKey(
                         phase_data.local_secret_rb as u32,
@@ -498,9 +501,10 @@ impl Pairing {
                 .set_identity_key();
         }
 
-        // Always agree to distribute identity key when the peer requests it,
-        // even without a local IRK — we'll send a zero IRK with our identity address.
-        if peer_features.responder_key_distribution.identity_key() {
+        // A fixed-address peripheral does not have an IRK to distribute. In
+        // that case decline IdKey rather than advertising the capability and
+        // later sending the reserved all-zero value.
+        if peer_features.responder_key_distribution.identity_key() && ops.local_irk() != [0; 16] {
             pairing_data
                 .local_features
                 .responder_key_distribution

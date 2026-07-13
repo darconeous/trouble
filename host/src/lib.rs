@@ -22,6 +22,13 @@ use crate::att::AttErrorCode;
 use crate::channel_manager::ChannelStorage;
 use crate::connection::Connection;
 use crate::connection_manager::ConnectionStorage;
+#[cfg(feature = "security-debug")]
+pub use crate::connection_manager::{set_connection_trace_handler, ConnectionTrace};
+#[cfg(feature = "security-debug")]
+pub use crate::security_manager::{
+    set_security_diagnostic_trace_handler, set_security_trace_handler, SecurityDiagnosticTrace, SecurityTrace,
+    SecurityTraceDirection,
+};
 #[cfg(feature = "security")]
 pub use crate::security_manager::{
     BondInformation, IdentityResolvingKey, LongTermKey, OobData, Reason as PairingFailedReason,
@@ -94,6 +101,8 @@ pub mod prelude {
     #[cfg(feature = "central")]
     pub use crate::central::*;
     pub use crate::connection::{ConnectRateParams, *};
+    #[cfg(feature = "security-debug")]
+    pub use crate::connection_manager::{set_connection_trace_handler, ConnectionTrace};
     #[cfg(feature = "gatt")]
     pub use crate::gap::*;
     #[cfg(feature = "gatt")]
@@ -109,6 +118,11 @@ pub mod prelude {
     pub use crate::peripheral::*;
     #[cfg(feature = "scan")]
     pub use crate::scan::*;
+    #[cfg(feature = "security-debug")]
+    pub use crate::security_manager::{
+        set_security_diagnostic_trace_handler, set_security_trace_handler, SecurityDiagnosticTrace, SecurityTrace,
+        SecurityTraceDirection,
+    };
     #[cfg(feature = "security")]
     pub use crate::security_manager::{
         BondInformation, IdentityResolvingKey, LongTermKey, OobData, Reason as PairingFailedReason,
@@ -472,6 +486,7 @@ use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 pub trait SecurityCmds:
     bt_hci::controller::Controller
     + ControllerCmdSync<LeLongTermKeyRequestReply>
+    + ControllerCmdSync<LeLongTermKeyRequestNegativeReply>
     + ControllerCmdAsync<LeEnableEncryption>
     + ControllerCmdSync<LeAddDeviceToResolvingList>
     + ControllerCmdSync<LeRemoveDeviceFromResolvingList>
@@ -487,6 +502,7 @@ pub trait SecurityCmds:
 impl<
         C: bt_hci::controller::Controller
             + ControllerCmdSync<LeLongTermKeyRequestReply>
+            + ControllerCmdSync<LeLongTermKeyRequestNegativeReply>
             + ControllerCmdAsync<LeEnableEncryption>
             + ControllerCmdSync<LeAddDeviceToResolvingList>
             + ControllerCmdSync<LeRemoveDeviceFromResolvingList>
@@ -810,6 +826,25 @@ impl<'stack, C: Controller, P: PacketPool> StackBuilder<'stack, C, P> {
         self
     }
 
+    /// Enable or disable accepting new peripheral pairing requests.
+    ///
+    /// When disabled, an idle incoming pairing request is rejected immediately with
+    /// `Pairing Failed: Pairing Not Supported`. A pairing already in progress is not
+    /// affected.
+    #[cfg(feature = "security")]
+    pub fn set_pairing_enabled(mut self, enabled: bool) -> Self {
+        self.host().connections.security_manager.set_pairing_enabled(enabled);
+        self
+    }
+
+    /// Set a fixed six-digit passkey for pairings where this device has the
+    /// display role. Pass `None` to restore a randomly generated passkey.
+    #[cfg(feature = "security")]
+    pub fn set_fixed_passkey(mut self, passkey: Option<u32>) -> Result<Self, Error> {
+        self.host().connections.security_manager.set_fixed_passkey(passkey)?;
+        Ok(self)
+    }
+
     /// Enable or disable secure connections only mode.
     ///
     /// When enabled, legacy pairing is rejected even if the `legacy-pairing` feature is compiled in.
@@ -886,6 +921,23 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
             .connections
             .security_manager
             .set_io_capabilities(io_capabilities);
+    }
+
+    /// Enable or disable accepting new peripheral pairing requests.
+    ///
+    /// When disabled, an idle incoming pairing request is rejected immediately with
+    /// `Pairing Failed: Pairing Not Supported`. A pairing already in progress is not
+    /// affected.
+    #[cfg(feature = "security")]
+    pub fn set_pairing_enabled(&self, enabled: bool) {
+        self.host.connections.security_manager.set_pairing_enabled(enabled);
+    }
+
+    /// Set a fixed six-digit passkey for pairings where this device has the
+    /// display role. Pass `None` to restore a randomly generated passkey.
+    #[cfg(feature = "security")]
+    pub fn set_fixed_passkey(&self, passkey: Option<u32>) -> Result<(), Error> {
+        self.host.connections.security_manager.set_fixed_passkey(passkey)
     }
 
     /// Enable or disable secure connections only mode.
