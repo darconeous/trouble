@@ -1730,12 +1730,15 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
             info!("[host] RPA timeout set to {}s", timeout_secs);
         }
 
-        // Initialize privacy: sync resolving list
+        // Initialize the controller's peer resolving list before any GAP
+        // procedure can start. Peer RPAs must be resolved for restored bonds
+        // even when this host itself uses a fixed public/static address and
+        // therefore has no local IRK.
         #[cfg(feature = "security")]
-        if host.is_privacy_enabled() {
+        {
             host.resolving_list_state.borrow_mut().clear();
             host.sync_resolving_list(ResolvingListUpdate::FullSync).await?;
-            info!("[host] privacy initialized");
+            info!("[host] resolving list initialized");
         }
 
         loop {
