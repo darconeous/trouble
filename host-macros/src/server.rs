@@ -161,7 +161,11 @@ impl ServerBuilder {
             };
             const _: () = const {
                 let exact = {4 + 6 * ({
-                    let mut cccd_sum = 0;
+                    // The GAP config contributes one CCCD of its own, for
+                    // Service Changed. Counted unconditionally: a server
+                    // built with `new` and a caller-supplied table simply
+                    // reserves one entry it does not use.
+                    let mut cccd_sum = 1;
                     #code_cccd_summation
                     cccd_sum
                 }
@@ -177,6 +181,10 @@ impl ServerBuilder {
             #visibility struct #name<'values>
             {
                 pub server: trouble_host::prelude::AttributeServer<'values, #mutex_type, #packet_type, _ATTRIBUTE_TABLE_SIZE, _CONNECTIONS_MAX>,
+                /// Handles for the GAP/GATT attributes, when this server built
+                /// them. `None` when the caller supplied its own table through
+                /// [`new`], since then the caller owns whatever GAP it added.
+                pub gap: Option<trouble_host::gap::GapHandles>,
                 #code_service_definition
             }
 
@@ -191,6 +199,7 @@ impl ServerBuilder {
 
                     Self {
                         server: trouble_host::prelude::AttributeServer::new(table),
+                        gap: None,
                         #code_server_populate
                     }
                 }
@@ -202,12 +211,13 @@ impl ServerBuilder {
                 #visibility fn new_default(name: &'values str) -> Result<Self, &'static str> {
                     let mut table: trouble_host::attribute::AttributeTable<'_, #mutex_type, _ATTRIBUTE_TABLE_SIZE> = trouble_host::attribute::AttributeTable::new();
 
-                    trouble_host::gap::GapConfig::default(name).build(&mut table)?;
+                    let gap = trouble_host::gap::GapConfig::default(name).build(&mut table)?;
 
                     #code_service_init
 
                     Ok(Self {
                         server: trouble_host::prelude::AttributeServer::new(table),
+                        gap: Some(gap),
                         #code_server_populate
                     })
                 }
@@ -220,12 +230,13 @@ impl ServerBuilder {
                 #visibility fn new_with_config(gap: trouble_host::gap::GapConfig<'values>) -> Result<Self, &'static str> {
                     let mut table: trouble_host::attribute::AttributeTable<'_, #mutex_type, _ATTRIBUTE_TABLE_SIZE> = trouble_host::attribute::AttributeTable::new();
 
-                    gap.build(&mut table)?;
+                    let gap = gap.build(&mut table)?;
 
                     #code_service_init
 
                     Ok(Self {
                         server: trouble_host::prelude::AttributeServer::new(table),
+                        gap: Some(gap),
                         #code_server_populate
                     })
                 }
