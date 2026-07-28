@@ -215,6 +215,10 @@ impl ServerBuilder {
 
                     #code_service_init
 
+                    // The database hash covers the application's services
+                    // too, so it can only be computed now.
+                    trouble_host::gap::finalize_gap(&gap, &table);
+
                     Ok(Self {
                         server: trouble_host::prelude::AttributeServer::new(table),
                         gap: Some(gap),
@@ -233,6 +237,10 @@ impl ServerBuilder {
                     let gap = gap.build(&mut table)?;
 
                     #code_service_init
+
+                    // The database hash covers the application's services
+                    // too, so it can only be computed now.
+                    trouble_host::gap::finalize_gap(&gap, &table);
 
                     Ok(Self {
                         server: trouble_host::prelude::AttributeServer::new(table),

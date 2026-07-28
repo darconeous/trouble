@@ -27,17 +27,18 @@ pub const DEVICE_NAME_MAX_LENGTH: usize = MAX_SMALL_DATA_SIZE;
 /// ├── APPEARANCE:                   2
 /// └── CENTRAL_ADDRESS_RESOLUTION:   2 (security+central only)
 /// GATT_SERVICE:                   + 1
-/// └── SERVICE_CHANGED:             + 3 (declaration, value, CCCD)
+/// ├── SERVICE_CHANGED:             + 3 (declaration, value, CCCD)
+/// └── DATABASE_HASH:               + 2 (security only — needs AES-CMAC)
 ///                                 ---
-///                                 = 9 (or 11 with security+central)
+///                                 = 9, 11 with security, 13 with security+central
 #[cfg(not(feature = "security"))]
 pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize = 9;
 /// The number of attributes added by the GAP and GATT services (with security, peripheral only)
 #[cfg(all(feature = "security", not(feature = "central")))]
-pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize = 9;
+pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize = 11;
 /// The number of attributes added by the GAP and GATT services (with security)
 #[cfg(all(feature = "security", feature = "central"))]
-pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize = 11;
+pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize = 13;
 
 /// The GAP and GATT attributes an application may need after the table is
 /// built.
@@ -56,6 +57,35 @@ pub struct GapHandles {
     /// bonded client discard a cached attribute — including a cached
     /// device name. Clients that have not subscribed are skipped.
     pub service_changed: Characteristic<[u8; 4]>,
+    /// GATT Database Hash (0x2B2A), when it can be computed.
+    ///
+    /// A client with robust caching reads this on reconnect and rediscovers
+    /// the database by itself when the value differs from the one it cached
+    /// — which is what keeps a firmware update that moves handles from
+    /// silently breaking every bonded peer. Unlike Service Changed it needs
+    /// no indication, no subscription, and no per-bond bookkeeping.
+    ///
+    /// `None` without the `security` feature, whose AES-CMAC the hash is
+    /// defined in terms of. Advertising a hash that cannot be computed
+    /// would be worse than not having one.
+    pub database_hash: Option<Characteristic<[u8; 16]>>,
+}
+
+/// Fill in values that depend on the finished table.
+///
+/// The database hash covers every attribute, so it cannot be known while
+/// the GAP services are being added — the application's own services come
+/// after. Call this once the table is complete and before serving it.
+pub fn finalize_gap<M: RawMutex, const MAX: usize>(handles: &GapHandles, table: &AttributeTable<'_, M, MAX>) {
+    #[cfg(feature = "security")]
+    if let Some(database_hash) = handles.database_hash {
+        // `hash()` reads the AES-CMAC output big-endian, while the
+        // characteristic carries it least-significant octet first
+        // (Core Spec Vol 3, Part G, §7.3.1).
+        let _ = table.set(&database_hash, &table.hash().to_le_bytes());
+    }
+    #[cfg(not(feature = "security"))]
+    let _ = (handles, table);
 }
 
 /// Configuration for the GAP Service.
@@ -144,11 +174,23 @@ fn build_gap_services<'a, M: RawMutex, const MAX: usize>(
             [0u8; 4],
         )
         .build();
+    // Readable without encryption on purpose: a client validates its cached
+    // database before it has any security, which is the whole point.
+    // Populated by `finalize_gap` once the table is complete.
+    #[cfg(feature = "security")]
+    let database_hash = Some(
+        gatt_builder
+            .add_characteristic_small(characteristic::DATABASE_HASH, [CharacteristicProp::Read], [0u8; 16])
+            .build(),
+    );
+    #[cfg(not(feature = "security"))]
+    let database_hash = None;
     gatt_builder.build();
 
     Ok(GapHandles {
         device_name,
         service_changed,
+        database_hash,
     })
 }
 
@@ -229,6 +271,38 @@ mod tests {
 
         assert!(handles.service_changed.props.has_cccd());
         assert!(handles.service_changed.cccd_handle.is_some());
+    }
+
+    // The hash has to describe the finished table, including services the
+    // application adds after the GAP config — a hash covering only GAP
+    // would never change when the parts a client actually caches do.
+    #[cfg(feature = "security")]
+    #[test]
+    fn database_hash_covers_services_added_after_the_gap_config() {
+        fn hash_with_extra_service(extra: bool) -> [u8; 16] {
+            let mut table: AttributeTable<'_, NoopRawMutex, 24> = AttributeTable::new();
+            let handles = GapConfig::Peripheral(PeripheralConfig {
+                name: "trouble",
+                appearance: &appearance::UNKNOWN,
+            })
+            .build(&mut table)
+            .unwrap();
+            if extra {
+                let mut svc = table.add_service(Service::new(0x1234_u16));
+                svc.add_characteristic_small(0x5678_u16, [CharacteristicProp::Read], [0u8; 2]);
+                svc.build();
+            }
+            finalize_gap(&handles, &table);
+            table.get(&handles.database_hash.unwrap()).unwrap()
+        }
+
+        let bare = hash_with_extra_service(false);
+        assert_ne!(bare, [0u8; 16], "the hash was never filled in");
+        assert_ne!(
+            bare,
+            hash_with_extra_service(true),
+            "adding a service left the hash unchanged"
+        );
     }
 
     #[test]
